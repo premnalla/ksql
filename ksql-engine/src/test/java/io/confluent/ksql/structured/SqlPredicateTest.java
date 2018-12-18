@@ -1,0 +1,128 @@
+/**
+ * Copyright 2017 Confluent Inc.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ **/
+
+package io.confluent.ksql.structured;
+
+import io.confluent.kafka.schemaregistry.client.MockSchemaRegistryClient;
+import io.confluent.ksql.analyzer.AggregateAnalysis;
+import io.confluent.ksql.analyzer.AggregateAnalyzer;
+import io.confluent.ksql.analyzer.Analysis;
+import io.confluent.ksql.analyzer.AnalysisContext;
+import io.confluent.ksql.analyzer.Analyzer;
+import io.confluent.ksql.function.InternalFunctionRegistry;
+import io.confluent.ksql.metastore.KsqlStream;
+import io.confluent.ksql.metastore.MetaStore;
+import io.confluent.ksql.parser.KsqlParser;
+import io.confluent.ksql.parser.tree.Expression;
+import io.confluent.ksql.parser.tree.Statement;
+import io.confluent.ksql.planner.LogicalPlanner;
+import io.confluent.ksql.planner.plan.FilterNode;
+import io.confluent.ksql.planner.plan.PlanNode;
+import io.confluent.ksql.schema.registry.MockSchemaRegistryClientFactory;
+import io.confluent.ksql.util.KsqlConfig;
+import io.confluent.ksql.util.MetaStoreFixture;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+import org.apache.kafka.common.serialization.Serdes;
+import org.apache.kafka.streams.StreamsBuilder;
+import org.apache.kafka.streams.kstream.Consumed;
+import org.apache.kafka.streams.kstream.KStream;
+import org.junit.Assert;
+import org.junit.Before;
+import org.junit.Test;
+
+public class SqlPredicateTest {
+  private SchemaKStream initialSchemaKStream;
+  private static final KsqlParser KSQL_PARSER = new KsqlParser();
+
+  MetaStore metaStore;
+  KStream kStream;
+  KsqlStream ksqlStream;
+  InternalFunctionRegistry functionRegistry;
+
+  @Before
+  public void init() {
+    metaStore = MetaStoreFixture.getNewMetaStore(new InternalFunctionRegistry());
+    functionRegistry = new InternalFunctionRegistry();
+    ksqlStream = (KsqlStream) metaStore.getSource("TEST1");
+    final StreamsBuilder builder = new StreamsBuilder();
+    kStream = builder.stream(ksqlStream.getKsqlTopic().getKafkaTopicName(), Consumed.with(Serdes.String(),
+                             ksqlStream.getKsqlTopic().getKsqlTopicSerDe().getGenericRowSerde(
+                                 ksqlStream.getSchema(), new KsqlConfig(Collections.emptyMap()),
+                                                   false, new MockSchemaRegistryClientFactory()::get
+                                                   )));
+  }
+
+
+  private PlanNode buildLogicalPlan(final String queryStr) {
+    final List<Statement> statements = KSQL_PARSER.buildAst(queryStr, metaStore);
+    final Analysis analysis = new Analysis();
+    final Analyzer analyzer = new Analyzer("sqlExpression", analysis, metaStore, "");
+    analyzer.process(statements.get(0), new AnalysisContext(null));
+    final AggregateAnalysis aggregateAnalysis = new AggregateAnalysis();
+    final AggregateAnalyzer aggregateAnalyzer = new AggregateAnalyzer(aggregateAnalysis,
+                                                                analysis, functionRegistry);
+    for (final Expression expression: analysis.getSelectExpressions()) {
+      aggregateAnalyzer.process(expression, new AnalysisContext(null));
+    }
+    // Build a logical plan
+    final PlanNode logicalPlan = new LogicalPlanner(analysis, aggregateAnalysis, functionRegistry).buildPlan();
+    return logicalPlan;
+  }
+
+  @Test
+  public void testFilter() throws Exception {
+    final String selectQuery = "SELECT col0, col2, col3 FROM test1 WHERE col0 > 100;";
+    final PlanNode logicalPlan = buildLogicalPlan(selectQuery);
+    final FilterNode filterNode = (FilterNode) logicalPlan.getSources().get(0).getSources().get(0);
+
+    initialSchemaKStream = new SchemaKStream(logicalPlan.getTheSourceNode().getSchema(),
+                                             kStream,
+                                             ksqlStream.getKeyField(), new ArrayList<>(),
+                                             SchemaKStream.Type.SOURCE, functionRegistry, new MockSchemaRegistryClient());
+    final SqlPredicate predicate = new SqlPredicate(filterNode.getPredicate(), initialSchemaKStream
+        .getSchema(), false, functionRegistry);
+
+    Assert.assertTrue(predicate.getFilterExpression()
+                          .toString().equalsIgnoreCase("(TEST1.COL0 > 100)"));
+    Assert.assertTrue(predicate.getColumnIndexes().length == 1);
+
+  }
+
+  @Test
+  public void testFilterBiggerExpression() throws Exception {
+    final String selectQuery = "SELECT col0, col2, col3 FROM test1 WHERE col0 > 100 AND LEN(col2) = 5;";
+    final PlanNode logicalPlan = buildLogicalPlan(selectQuery);
+    final FilterNode filterNode = (FilterNode) logicalPlan.getSources().get(0).getSources().get(0);
+
+    initialSchemaKStream = new SchemaKStream(logicalPlan.getTheSourceNode().getSchema(),
+                                             kStream,
+                                             ksqlStream.getKeyField(), new ArrayList<>(),
+                                             SchemaKStream.Type.SOURCE, functionRegistry, new MockSchemaRegistryClient());
+    final SqlPredicate predicate = new SqlPredicate(filterNode.getPredicate(), initialSchemaKStream
+        .getSchema(), false, functionRegistry);
+
+    Assert.assertTrue(predicate
+                          .getFilterExpression()
+                          .toString()
+                          .equalsIgnoreCase("((TEST1.COL0 > 100) AND"
+                                            + " (LEN(TEST1.COL2) = 5))"));
+    Assert.assertTrue(predicate.getColumnIndexes().length == 3);
+
+  }
+
+}
